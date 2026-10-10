@@ -1,0 +1,19 @@
+version: '3'
+
+tasks:
+  check:
+    cmds:
+      - go fmt ./...
+      - go vet ./...
+      - go test ./...
+  build:
+    cmd: go build -o bin/twig ./cmd/twig
+  run:
+    cmd: go run ./cmd/twig {{.CLI_ARGS}}
+  example:
+    cmds:
+      - go run ./examples/grove/generate
+      - go run ./cmd/twig validate dist/grove/twig.yml --artifacts dist/grove
+      - go run ./cmd/twig generate dist/grove/twig.yml --output dist/grove --force
+  serve:
+    cmd: go run ./examples/grove/generate serve

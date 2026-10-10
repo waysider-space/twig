@@ -1,0 +1,304 @@
+$ErrorActionPreference = 'Stop'
+
+if (-not [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows)) {
+  throw 'Windows is required'
+}
+
+Add-Type -TypeDefinition @'
+{{template "windows.cs.tmpl" .}}
+'@
+
+$twigArch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant()
+switch ($twigArch) {
+{{range .Targets}}
+  {{psq .Arch}} {
+    $twigURL = {{psq .URL}}
+    $twigExpected = {{psq .SHA256}}
+    $twigFiles = @(
+{{range .Files}}
+      @{ Source = {{psq .Source}}; Destination = {{psq .Destination}}; Path = {{psq .Path}}; Policy = {{psq .Policy}}; Binary = ${{if .Executable}}true{{else}}false{{end}} }
+{{end}}
+    )
+  }
+{{end}}
+  default { throw "Unsupported architecture: $twigArch" }
+}
+
+$twigRootDefaults = @{
+{{range .Roots}}
+  {{psq .Category}} = @{ Folder = {{psq .Folder}}; Suffix = {{psq .Suffix}} }
+{{end}}
+}
+
+function Get-TwigRoot($category) {
+  $override = [Environment]::GetEnvironmentVariable('TWIG_' + $category.ToUpperInvariant() + '_DIR')
+  if ($override) {
+    if ($override -notmatch '^(?:[A-Za-z]:[\\/]|\\\\[^\\]+\\[^\\]+)' -or $override -match '[\r\n]') {
+      throw 'Installation roots must be absolute paths without line breaks'
+    }
+    $value = $override
+  } else {
+    $rule = $twigRootDefaults[$category]
+    $folder = [Enum]::Parse([Environment+SpecialFolder], $rule.Folder)
+    $value = [Environment]::GetFolderPath($folder)
+    if (-not $value) { throw 'Installation root is unavailable' }
+    if ($rule.Suffix) { $value = Join-Path $value $rule.Suffix }
+  }
+  if (-not $value) { throw 'Installation root is unavailable' }
+  $value = [IO.Path]::GetFullPath($value)
+  $ancestor = $value
+  while ($ancestor) {
+    if (Test-Path -LiteralPath $ancestor) {
+      $item = Get-Item -LiteralPath $ancestor -Force
+      if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw 'Installation roots must be directories without reparse points'
+      }
+    }
+    $ancestor = [IO.Path]::GetDirectoryName($ancestor)
+  }
+  [IO.Directory]::CreateDirectory($value) | Out-Null
+
+  return [TwigNative]::Root($value)
+}
+
+function Test-TwigPath($base, $relative) {
+  $current = $base
+  $parts = $relative.Split('/')
+  for ($index = 0; $index -lt $parts.Length; $index++) {
+    $current = Join-Path $current $parts[$index]
+    $item = Get-Item -LiteralPath $current -Force -ErrorAction SilentlyContinue
+    if ($null -ne $item) {
+      if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        throw 'Linked installation paths are not allowed'
+      }
+      if ($index -lt $parts.Length - 1 -and -not $item.PSIsContainer) {
+        throw 'A destination parent is not a directory'
+      }
+      if ($index -eq $parts.Length - 1 -and $item.PSIsContainer) {
+        throw 'A destination is not a regular file'
+      }
+    }
+  }
+}
+
+function Test-TwigDestinations {
+  $seen = @()
+  foreach ($file in $twigFiles) {
+    $base = $twigRoots[$file.Destination]
+    Test-TwigPath $base $file.Path
+    $destination = [IO.Path]::GetFullPath((Join-Path $base $file.Path.Replace('/', '\')))
+    if ($file.Policy -eq 'error' -and (Test-Path -LiteralPath $destination)) {
+      throw 'A destination already exists'
+    }
+    $key = $destination.TrimEnd('\').ToLowerInvariant()
+    foreach ($previous in $seen) {
+      if ($key -eq $previous -or $key.StartsWith($previous + '\') -or $previous.StartsWith($key + '\')) {
+        throw 'Conflicting installation destinations'
+      }
+    }
+    $seen += $key
+  }
+}
+
+function Get-TwigCanonicalName($value) {
+  $parts = New-Object 'System.Collections.Generic.List[string]'
+  foreach ($part in $value.Replace('\', '/').Split('/')) {
+    if ($part -eq '' -or $part -eq '.') { continue }
+    if ($part -eq '..') {
+      if ($parts.Count -gt 0) { $parts.RemoveAt($parts.Count - 1) }
+
+      continue
+    }
+    $parts.Add($part)
+  }
+
+  return [String]::Join('/', $parts).ToLowerInvariant()
+}
+
+$twigRoots = @{}
+foreach ($file in $twigFiles) {
+  if (-not $twigRoots.ContainsKey($file.Destination)) {
+    $twigRoots[$file.Destination] = Get-TwigRoot $file.Destination
+  }
+}
+Test-TwigDestinations
+
+$twigTemp = Join-Path ([IO.Path]::GetTempPath()) ([Guid]::NewGuid().ToString())
+[IO.Directory]::CreateDirectory($twigTemp) | Out-Null
+$twigPending = $null
+
+try {
+  $token = {{if .AuthEnv}}[Environment]::GetEnvironmentVariable({{psq .AuthEnv}}){{else}}$null{{end}}
+  if ($token -and $token -cnotmatch '^[A-Za-z0-9._~+/=-]+$') {
+    throw 'Invalid download token'
+  }
+  $archive = Join-Path $twigTemp 'artifact'
+  try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    $address = [Uri]$twigURL
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    for ($redirects = 0; ; $redirects++) {
+      $remaining = 120000 - [int]$watch.ElapsedMilliseconds
+      if ($remaining -le 0) { throw 'Download timeout' }
+      $request = [Net.HttpWebRequest]::Create($address)
+      $request.AllowAutoRedirect = $false
+      $request.Timeout = $remaining
+      $request.ReadWriteTimeout = $remaining
+      if ($token) { $request.Headers['Authorization'] = 'Bearer ' + $token }
+      $response = $request.GetResponse()
+      if ([int]$response.StatusCode -eq 200) { break }
+      try {
+        if ([int]$response.StatusCode -notin @(301, 302, 303, 307, 308) -or $redirects -ge 5) {
+          throw 'Unexpected download response'
+        }
+        $location = $response.Headers['Location']
+        if (-not $location) { throw 'Missing redirect location' }
+        $next = [Uri]::new($address, $location)
+        if ($next.Scheme -notin @('http', 'https') -or ($address.Scheme -eq 'https' -and $next.Scheme -ne 'https') -or $next.UserInfo) {
+          throw 'Invalid download redirect'
+        }
+        $address = $next
+        $token = $null
+      } finally {
+        $response.Dispose()
+      }
+    }
+    try {
+      $source = $response.GetResponseStream()
+      $destination = [IO.File]::Create($archive)
+      try {
+        $buffer = New-Object byte[] 65536
+        while ($true) {
+          $remaining = 120000 - [int]$watch.ElapsedMilliseconds
+          if ($remaining -le 0) { throw 'Download timeout' }
+          $readTask = $source.ReadAsync($buffer, 0, $buffer.Length)
+          if (-not $readTask.Wait($remaining)) {
+            $request.Abort()
+            throw 'Download timeout'
+          }
+          $read = $readTask.Result
+          if ($watch.Elapsed.TotalSeconds -ge 120) { throw 'Download timeout' }
+          if ($read -eq 0) { break }
+          $destination.Write($buffer, 0, $read)
+        }
+      } finally {
+        $destination.Dispose()
+        $source.Dispose()
+      }
+    } finally {
+      $response.Dispose()
+    }
+  } catch {
+    throw 'Artifact download failed'
+  } finally {
+    $token = $null
+  }
+
+  $hasher = [Security.Cryptography.SHA256]::Create()
+  $stream = [IO.File]::OpenRead($archive)
+  try {
+    $actual = [BitConverter]::ToString($hasher.ComputeHash($stream)).Replace('-', '').ToLowerInvariant()
+  } finally {
+    $stream.Dispose()
+    $hasher.Dispose()
+  }
+  if ($actual -ne $twigExpected) { throw 'Download checksum mismatch' }
+
+  Add-Type -AssemblyName System.IO.Compression.FileSystem
+  $checksums = [TwigNative]::Checksums($archive, {{.Limits.MaxEntries}})
+  $zip = [IO.Compression.ZipFile]::OpenRead($archive)
+  try {
+{{if .Limits.MaxEntries}}
+    if ($zip.Entries.Count -gt {{.Limits.MaxEntries}}) { throw 'Too many archive entries' }
+{{end}}
+    if ($checksums.Length -ne $zip.Entries.Count) { throw 'Invalid ZIP directory count' }
+    $expanded = [long]0
+    for ($index = 0; $index -lt $twigFiles.Count; $index++) {
+      $file = $twigFiles[$index]
+      $canonical = Get-TwigCanonicalName $file.Source
+      $entries = @($zip.Entries | Where-Object { (Get-TwigCanonicalName $_.FullName) -ceq $canonical })
+      if ($entries.Count -ne 1 -or $entries[0].FullName -cne $file.Source -or $entries[0].Length -eq 0) {
+        throw 'An archive file is missing, empty, or ambiguous'
+      }
+      $entry = $entries[0]
+      $type = ($entry.ExternalAttributes -shr 16) -band 0xF000
+      if (($type -ne 0 -and $type -ne 0x8000) -or ($entry.ExternalAttributes -band 0x10)) {
+        throw 'Selected archive files must be regular files'
+      }
+      $remaining = [long]0
+{{if .Limits.MaxExpandedBytes}}
+      $remaining = {{.Limits.MaxExpandedBytes}} - $expanded
+      if ($entry.Length -gt $remaining) { throw 'Archive exceeds expanded size limit' }
+{{end}}
+      $source = $entry.Open()
+      $destination = [IO.File]::Create((Join-Path $twigTemp "file-$index"))
+      try {
+        $crc = [TwigNative]::Stage($source, $destination, $entry.Length, $remaining)
+        if ($crc -ne $checksums[$zip.Entries.IndexOf($entry)]) { throw 'Archive file checksum mismatch' }
+{{if .Limits.MaxExpandedBytes}}
+        $expanded += $entry.Length
+{{end}}
+      } finally {
+        $destination.Dispose()
+        $source.Dispose()
+      }
+      if ($file.Binary) {
+        $stream = [IO.File]::OpenRead((Join-Path $twigTemp "file-$index"))
+        $reader = New-Object IO.BinaryReader($stream)
+        try {
+          if ($reader.ReadUInt16() -ne 0x5A4D) { throw 'Missing MZ signature' }
+          $stream.Position = 60
+          $offset = $reader.ReadUInt32()
+          if ($offset -lt 64 -or $offset -gt 1048576) { throw 'Invalid PE header offset' }
+          $stream.Position = $offset
+          if ($reader.ReadUInt32() -ne 0x00004550) { throw 'Missing PE signature' }
+          $machine = $reader.ReadUInt16()
+          $expectedMachine = if ($twigArch -eq 'arm64') { 0xAA64 } else { 0x8664 }
+          if ($machine -ne $expectedMachine) { throw 'PE architecture does not match platform' }
+        } finally {
+          $reader.Dispose()
+          $stream.Dispose()
+        }
+      }
+    }
+  } finally {
+    $zip.Dispose()
+  }
+
+  Test-TwigDestinations
+  for ($index = 0; $index -lt $twigFiles.Count; $index++) {
+    $file = $twigFiles[$index]
+    $base = $twigRoots[$file.Destination]
+    Test-TwigPath $base $file.Path
+    $destination = Join-Path $base $file.Path.Replace('/', '\')
+    if ((Test-Path -LiteralPath $destination) -and $file.Policy -eq 'preserve') {
+      Write-Output "Preserved $destination"
+
+      continue
+    }
+    if ((Test-Path -LiteralPath $destination) -and $file.Policy -eq 'error') {
+      throw 'A destination appeared during installation'
+    }
+    $parent = [IO.Path]::GetDirectoryName($destination)
+    [IO.Directory]::CreateDirectory($parent) | Out-Null
+    Test-TwigPath $base $file.Path
+    $twigPending = Join-Path $parent ('.twig.' + [Guid]::NewGuid().ToString())
+    [IO.File]::Copy((Join-Path $twigTemp "file-$index"), $twigPending)
+    Test-TwigPath $base $file.Path
+    if (Test-Path -LiteralPath $destination) {
+      [IO.File]::Replace($twigPending, $destination, $null)
+    } else {
+      [IO.File]::Move($twigPending, $destination)
+    }
+    $twigPending = $null
+    Write-Output "Installed $destination"
+  }
+  if ($twigRoots.ContainsKey('bin') -and -not (($env:PATH -split ';') -contains $twigRoots['bin'])) {
+    Write-Output "Add $($twigRoots['bin']) to PATH to run installed commands."
+  }
+} finally {
+  if ($twigPending -and (Test-Path -LiteralPath $twigPending)) {
+    Remove-Item -LiteralPath $twigPending -Force
+  }
+  Remove-Item -LiteralPath $twigTemp -Recurse -Force
+}

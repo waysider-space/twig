@@ -1,0 +1,276 @@
+#!/bin/sh
+set -eu
+umask 077
+
+fail() {
+  printf '%s\n' "$1" >&2
+  exit 1
+}
+
+os=$(uname -s)
+arch=$(uname -m)
+
+case "$os/$arch" in
+{{range .Targets}}
+  {{.Pattern}})
+    artifact_url={{shq .URL}}
+    expected={{shq .SHA256}}
+    files={{shq .Entries}}
+{{range .Roots}}
+    {{.Category}}_default() {
+{{if .Environment}}
+      case "{{printf "${%s:-}" .Environment}}" in
+        /*) printf '%s\n' "{{printf "${%s}" .Environment}}"; return ;;
+      esac
+{{end}}
+      printf '%s/%s\n' "${home:?HOME is required}" {{shq .Suffix}}
+    }
+{{end}}
+    ;;
+{{end}}
+  *) fail "Unsupported platform: $os/$arch" ;;
+esac
+
+tmpdir=$(mktemp -d)
+trap 'rm -rf "$tmpdir"' 0
+trap 'exit 1' HUP INT TERM
+
+root() {
+  case "$1" in
+    /*) ;;
+    *) fail 'Installation roots must be absolute paths' ;;
+  esac
+  carriage_return=$(printf '\r')
+  case "$1" in
+    *'
+'*|*"$carriage_return"*) fail 'Installation roots cannot contain line breaks' ;;
+  esac
+  mkdir -p "$1" || fail 'Cannot create installation root'
+  (cd "$1" && pwd -P)
+}
+
+home=${HOME:-}
+bin_dir=''
+config_dir=''
+data_dir=''
+
+if printf '%s\n' "$files" | awk '$2 == "bin" { found = 1 } END { exit !found }'; then
+  bin_dir=$(root "${TWIG_BIN_DIR:-$(bin_default)}")
+fi
+if printf '%s\n' "$files" | awk '$2 == "config" { found = 1 } END { exit !found }'; then
+  config_dir=$(root "${TWIG_CONFIG_DIR:-$(config_default)}")
+fi
+if printf '%s\n' "$files" | awk '$2 == "data" { found = 1 } END { exit !found }'; then
+  data_dir=$(root "${TWIG_DATA_DIR:-$(data_default)}")
+fi
+
+destination_root() {
+  case "$1" in
+    bin) printf '%s\n' "$bin_dir" ;;
+    config) printf '%s\n' "$config_dir" ;;
+    data) printf '%s\n' "$data_dir" ;;
+  esac
+}
+
+check_path() {
+  check_base=$1
+  check_relative=$2
+  while :; do
+    part=${check_relative%%/*}
+    check_base=$check_base/$part
+    [ ! -L "$check_base" ] || fail 'Linked installation paths are not allowed'
+    case "$check_relative" in
+      */*)
+        if [ -e "$check_base" ] && [ ! -d "$check_base" ]; then
+          fail 'A destination parent is not a directory'
+        fi
+        check_relative=${check_relative#*/}
+        ;;
+      *)
+        if [ -e "$check_base" ] && [ ! -f "$check_base" ]; then
+          fail 'A destination is not a regular file'
+        fi
+        break
+        ;;
+    esac
+  done
+}
+
+preflight() {
+  : > "$tmpdir/destinations"
+  while IFS=' ' read -r source category relative policy mode; do
+    base=$(destination_root "$category")
+    check_path "$base" "$relative"
+    destination=$base/$relative
+    if [ "$policy" = error ] && [ -e "$destination" ]; then
+      fail 'A destination already exists'
+    fi
+    key=$destination
+    if [ "$os" = Darwin ]; then
+      key=$(printf '%s' "$key" | tr '[:upper:]' '[:lower:]')
+    fi
+    while IFS= read -r previous; do
+      case "$key" in
+        "$previous"|"$previous"/*) fail 'Conflicting installation destinations' ;;
+      esac
+      case "$previous" in
+        "$key"/*) fail 'Conflicting installation destinations' ;;
+      esac
+    done < "$tmpdir/destinations"
+    printf '%s\n' "$key" >> "$tmpdir/destinations"
+  done <<EOF
+$files
+EOF
+}
+
+preflight
+
+token={{.AuthExpr}}
+case "$token" in
+  *[!A-Za-z0-9._~+/=-]*) fail 'Invalid download token' ;;
+esac
+
+archive=$tmpdir/artifact
+case "$artifact_url" in
+  http://*) protocols='=http,https' ;;
+  *) protocols='=https' ;;
+esac
+
+deadline=$(($(date +%s) + 120))
+redirects=0
+while :; do
+  remaining=$((deadline - $(date +%s)))
+  [ "$remaining" -gt 0 ] || fail 'Artifact download failed'
+  if [ -n "$token" ]; then
+    if ! response=$(printf 'header = "Authorization: Bearer %s"\n' "$token" | curl -q --config - --proto "$protocols" --max-time "$remaining" -fsS "$artifact_url" -o "$archive" -w '%{http_code}\n%{redirect_url}' 2>/dev/null); then
+      fail 'Artifact download failed'
+    fi
+  else
+    if ! response=$(curl -q --proto "$protocols" --max-time "$remaining" -fsS "$artifact_url" -o "$archive" -w '%{http_code}\n%{redirect_url}' 2>/dev/null); then
+      fail 'Artifact download failed'
+    fi
+  fi
+  token=''
+  status=${response%%'
+'*}
+  case "$status" in
+    200) break ;;
+    301|302|303|307|308)
+      [ "$redirects" -lt 5 ] || fail 'Artifact download failed'
+      artifact_url=${response#*'
+'}
+      case "$artifact_url" in
+        https://*) protocols='=https' ;;
+        http://*) [ "$protocols" != '=https' ] || fail 'Artifact download failed' ;;
+        *) fail 'Artifact download failed' ;;
+      esac
+      redirects=$((redirects + 1))
+      ;;
+    *) fail 'Artifact download failed' ;;
+  esac
+done
+unset token
+
+if command -v sha256sum >/dev/null 2>&1; then
+  actual=$(sha256sum "$archive" | cut -d ' ' -f 1)
+elif command -v shasum >/dev/null 2>&1; then
+  actual=$(shasum -a 256 "$archive" | cut -d ' ' -f 1)
+else
+  fail 'A SHA-256 tool is required'
+fi
+[ "$actual" = "$expected" ] || fail 'Download checksum mismatch'
+
+raw=$tmpdir/archive.tar
+{{if .Limits.MaxExpandedBytes}}
+gzip -dc "$archive" 2>/dev/null | head -c "$(({{.Limits.MaxExpandedBytes}} + 1))" > "$raw"
+[ "$(wc -c < "$raw" | tr -d ' ')" -le {{.Limits.MaxExpandedBytes}} ] || fail 'Archive exceeds expanded size limit'
+{{else}}
+gzip -dc "$archive" > "$raw" 2>/dev/null || fail 'Invalid gzip archive'
+{{end}}
+gzip -t "$archive" 2>/dev/null || fail 'Invalid gzip archive'
+tar -tf "$raw" > "$tmpdir/entries" 2>/dev/null || fail 'Invalid tar archive'
+{{if .Limits.MaxEntries}}
+[ "$(wc -l < "$tmpdir/entries" | tr -d ' ')" -le {{.Limits.MaxEntries}} ] || fail 'Too many archive entries'
+{{end}}
+
+expanded=0
+i=0
+while IFS=' ' read -r source category relative policy mode; do
+  count=$(awk -v entry="$source" '
+    function clean(value, parts, size, i, count, result) {
+      size = split(value, parts, "/")
+      for (i = 1; i <= size; i++) {
+        if (parts[i] == "" || parts[i] == ".") continue
+        if (parts[i] == "..") {
+          if (count > 0) count--
+          continue
+        }
+        parts[++count] = parts[i]
+      }
+      for (i = 1; i <= count; i++) result = result (i > 1 ? "/" : "") parts[i]
+      return result
+    }
+    clean($0) == clean(entry) { matches++ }
+    END { print matches + 0 }
+  ' "$tmpdir/entries")
+  [ "$count" = 1 ] || fail 'An archive file is missing or ambiguous'
+  match=$(tar -tf "$raw" --no-recursion -- "$source" 2>/dev/null) || fail 'An archive file is missing'
+  [ "$match" = "$source" ] || fail 'An archive file is ambiguous'
+  details=$(tar -tvf "$raw" --no-recursion -- "$source" 2>/dev/null) || fail 'Cannot inspect archive file'
+  case "$details" in
+    -*) ;;
+    *) fail 'Selected archive files must be regular files' ;;
+  esac
+  {{if .Limits.MaxExpandedBytes}}
+  remaining=$(({{.Limits.MaxExpandedBytes}} - expanded))
+  { tar -xOf "$raw" --no-recursion -- "$source" 2>/dev/null || : > "$tmpdir/read-failed"; } | head -c "$((remaining + 1))" > "$tmpdir/file-$i"
+  written=$(wc -c < "$tmpdir/file-$i" | tr -d ' ')
+  [ "$written" -le "$remaining" ] || fail 'Archive exceeds expanded size limit'
+  [ ! -e "$tmpdir/read-failed" ] || fail 'Cannot read archive file'
+  expanded=$((expanded + written))
+  {{else}}
+  tar -xOf "$raw" --no-recursion -- "$source" > "$tmpdir/file-$i" 2>/dev/null || fail 'Cannot read archive file'
+  {{end}}
+  [ -s "$tmpdir/file-$i" ] || fail 'Selected archive files cannot be empty'
+  i=$((i + 1))
+done <<EOF
+$files
+EOF
+
+preflight
+
+pending=''
+trap 'if [ -n "$pending" ]; then rm -f "$pending"; fi; rm -rf "$tmpdir"' 0
+i=0
+while IFS=' ' read -r source category relative policy mode; do
+  base=$(destination_root "$category")
+  check_path "$base" "$relative"
+  destination=$base/$relative
+  if [ -e "$destination" ] && [ "$policy" = preserve ]; then
+    printf 'Preserved %s\n' "$destination"
+  else
+    if [ -e "$destination" ] && [ "$policy" = error ]; then
+      fail 'A destination appeared during installation'
+    fi
+    parent=${destination%/*}
+    mkdir -p "$parent" || fail 'Cannot create destination directory'
+    check_path "$base" "$relative"
+    pending=$(mktemp "$parent/.twig.XXXXXXXX")
+    cat "$tmpdir/file-$i" > "$pending" || fail 'Cannot stage destination file'
+    chmod "$mode" "$pending"
+    check_path "$base" "$relative"
+    mv -f "$pending" "$destination" || fail 'Cannot publish destination file; earlier files may already be installed'
+    pending=''
+    printf 'Installed %s\n' "$destination"
+  fi
+  i=$((i + 1))
+done <<EOF
+$files
+EOF
+
+if [ -n "$bin_dir" ]; then
+  case ":${PATH:-}:" in
+    *":$bin_dir:"*) ;;
+    *) printf 'Add %s to PATH to run installed commands.\n' "$bin_dir" ;;
+  esac
+fi

@@ -1,0 +1,19 @@
+schema: 1
+name: grove
+version: 1.0.0
+targets:
+  - os: linux
+    arch: amd64
+    url: https://downloads.example.com/grove/1.0.0/grove-linux-amd64.tar.gz
+    sha256: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    artifact: grove-linux-amd64.tar.gz
+    files:
+      - source: bin/grove
+        destination: bin
+        path: grove
+      - source: defaults/config.toml
+        destination: config
+        path: grove/config.toml
+      - source: assets/theme.json
+        destination: data
+        path: grove/theme.json
