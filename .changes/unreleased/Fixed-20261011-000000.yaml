@@ -1,0 +1,3 @@
+kind: Fixed
+body: Allow Windows installers to replace existing files during reinstall.
+time: 2026-10-11T00:00:00-05:00

@@ -286,7 +286,7 @@ try {
     [IO.File]::Copy((Join-Path $twigTemp "file-$index"), $twigPending)
     Test-TwigPath $base $file.Path
     if (Test-Path -LiteralPath $destination) {
-      [IO.File]::Replace($twigPending, $destination, $null)
+      [IO.File]::Replace($twigPending, $destination, [NullString]::Value)
     } else {
       [IO.File]::Move($twigPending, $destination)
     }
